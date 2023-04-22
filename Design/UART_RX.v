@@ -19,32 +19,29 @@
 // 
 //////////////////////////////////////////////////////////////////////////////////
 
-
-module UART_RX(
-input CLK_50M,
-input rst_n,
-input RX,
-input [2:0] bps_sel,
-input check_sel,
-output reg [7:0] dout,
-output reg error
+module UART_RX#(
+    parameter BAUD_RATE = 115200,
+    parameter CLK_FREQ = 10_000_000,
+    parameter VLD_DATA_WIDTH = 8,
+    parameter CHECK_SEL = 1)
+    (
+    input CLK,
+    input rst_n,
+    input RX,
+    output reg [VLD_DATA_WIDTH-1:0] dout,
+    output reg error,
+    output reg RX_dout_vld
     );
 
-//波特率选择
-localparam bps600   = 17'd8_3333;
-localparam bps1200  = 17'd4_1667;
-localparam bps2400  = 17'd2_0833;
-localparam bps4800  = 17'd1_0417;
-localparam bps9600  = 17'd5208;
-localparam bps19200 = 17'd2604;
-localparam bps38400 = 17'd1302;
-
 //状态机参数
-localparam WAIT_START = 1,RX_VLD_DATA = 2,RX_CHECK = 3,RX_STOP = 4;
+localparam IDLE = 0,RECV_START = 1,RX_VLD_DATA = 2,RX_CHECK = 3,RX_STOP = 4;
+localparam CLKS_PER_BIT =   CLK_FREQ / BAUD_RATE;
 
 reg RX_flag;
 wire dec_RX;
-reg[3:0] bit_cnt;//指示当前波特周期在接收第几位数据(跳过起始位，0-9)
+reg data_bit_mid,stop_bit_mid;
+reg return_idle;
+
 reg[7:0]dout_reg;
 wire e_check;
 wire o_check;
@@ -52,13 +49,12 @@ wire check;
 reg [2:0] cs,ns;
 reg RX_d1,RX_d2,RX_d3; //d1,d2为消除亚稳态，d3为下降沿检测
 
-//波特率计数器
-reg [16:0] bps_mode;
-reg [16:0] bps_cnt; //最慢的bps600模式需要17位计数器
+//时钟计数器
+reg [31:0] CLK_cnt; //最慢的bps600模式需要17位计数器
+reg[3:0] bit_cnt;//指示当前波特周期在接收第几位数据(跳过起始位，1-11)
 
-
-//消除亚稳态+亚稳态
-always@(posedge CLK_50M or negedge rst_n)begin
+//TAG 消除亚稳态+亚稳态
+always@(posedge CLK or negedge rst_n)begin
     if(!rst_n)begin
         RX_d1 <= 1'b0;
         RX_d2 <= 1'b0;
@@ -75,97 +71,146 @@ end
 assign dec_RX = RX_d3 && ~RX_d2;
 
 //RX_flag control
-always@(posedge CLK_50M,posedge rst_n)begin
-    if(!rst_n)begin
+always@(posedge CLK,posedge rst_n)begin
+    if(!rst_n)
         RX_flag <= 0;
-    end
-    else if(bit_cnt=='d9&&bps_cnt==bps_mode-1)begin
+    else if(cs==RECV_START&&return_idle)
         RX_flag <= 0;
-    end
-    else if(dec_RX)begin
+    else if(cs==RX_STOP&&CLK_cnt==CLKS_PER_BIT-1)
+        RX_flag <= 0;
+    else if(dec_RX)
         RX_flag <= 1;
-    end
 end
 
 //bit_cnt控制
-always@(posedge CLK_50M,negedge rst_n)begin
+always@(posedge CLK,negedge rst_n)begin
     if(!rst_n)
         bit_cnt <= 'd0;
     else if(RX_flag) begin
-        if(bps_cnt == bps_mode-1)
-            bit_cnt <= bit_cnt + 1;
+        if(cs!=RECV_START)begin
+           if(CLK_cnt == CLKS_PER_BIT-1)
+            bit_cnt <= bit_cnt + 1; 
+        end
+        else begin
+            if(!return_idle)
+                bit_cnt <= 'd2;
+            else
+                bit_cnt <= 'd0;
+        end
     end
     else 
         bit_cnt <='d0;
 end
 
-//波特率计数
-always@(posedge CLK_50M or negedge rst_n)begin
+//时钟计数
+always@(posedge CLK or negedge rst_n)begin
   if(!rst_n)
-    bps_cnt <= 'd0;
-  else if(bps_cnt == bps_mode-1) 
-    bps_cnt <= 'd0;
+    CLK_cnt <= 'd0;
+  else if(CLK_cnt == (0.5*CLKS_PER_BIT)+1&&cs==RECV_START)begin//当采样完中间信号时计数器重置
+    CLK_cnt <= 'd0;
+  end
+  else if(CLK_cnt == CLKS_PER_BIT-1) 
+    CLK_cnt <= 'd0;
   else if(RX_flag)	//与发送端波特率同步
-    bps_cnt <= bps_cnt + 1'b1;
+    CLK_cnt <= CLK_cnt + 1'b1;
   else
-    bps_cnt <= 'd0;
+    CLK_cnt <= 'd0;
+end
+
+//data_bit_mid,stop_bit_mid，return _IDLE信号控制信号控制
+always@(posedge CLK,negedge rst_n) begin
+    if(!rst_n)begin
+        data_bit_mid <= 0;
+        stop_bit_mid <= 0;
+        return_idle <= 0;
+    end
+    else begin
+        if(cs==RECV_START&&CLK_cnt==(0.5*CLKS_PER_BIT))//在接收到下降沿后的半个周期的尾端进行采样
+            if(RX_d2 == 0)
+                return_idle <= 0;
+            else
+                return_idle <= 1;
+        else
+            return_idle <= 0;
+
+        if(cs==RX_VLD_DATA&&CLK_cnt==CLKS_PER_BIT-1)
+            data_bit_mid <= 1;
+        else
+            data_bit_mid <= 0;
+
+        if(cs==RX_STOP&&CLK_cnt==CLKS_PER_BIT-1)
+            stop_bit_mid <= 1;
+        else
+            stop_bit_mid <= 0;
+    end
 end
 
 
-//接收状态机
+
+//接收状态控制
 always@(*)begin
     case(cs)
-        WAIT_START:ns = (RX_flag)?RX_VLD_DATA:WAIT_START;
-        RX_VLD_DATA:ns = (bit_cnt==7&&bps_cnt==bps_mode-1)?RX_CHECK:RX_VLD_DATA;
-        RX_CHECK:ns = (bit_cnt==8&&bps_cnt==bps_mode-1)?RX_STOP:RX_CHECK;
-        RX_STOP:ns = (bit_cnt==9&&bps_cnt==bps_mode-1)?WAIT_START:RX_STOP;
-        default:ns = WAIT_START;
+        IDLE:ns = (RX_flag)?RECV_START:IDLE;
+        RECV_START:ns = (CLK_cnt<(0.5*CLKS_PER_BIT+1))?RECV_START:((CLK_cnt==(0.5*CLKS_PER_BIT+1)&&return_idle)?IDLE:RX_VLD_DATA);
+        RX_VLD_DATA:ns = (bit_cnt==VLD_DATA_WIDTH+1&&CLK_cnt==CLKS_PER_BIT-1)?RX_CHECK:RX_VLD_DATA;
+        RX_CHECK:ns = (bit_cnt==VLD_DATA_WIDTH+2&&CLK_cnt==CLKS_PER_BIT-1)?RX_STOP:RX_CHECK;
+        RX_STOP:ns = (bit_cnt==VLD_DATA_WIDTH+3&&CLK_cnt==CLKS_PER_BIT-1)?IDLE:RX_STOP;
+        default:ns = IDLE;
     endcase
 end
 
-always@(posedge CLK_50M,negedge rst_n)begin
+always@(posedge CLK,negedge rst_n)begin
     if(!rst_n)begin
-        cs <= WAIT_START;
+        cs <= IDLE;
     end
     else begin
         cs <= ns;
     end
 end
 
-//接收输出数据和数据缓存
-always@(posedge CLK_50M,negedge rst_n)begin
+//接收数据和缓存
+always@(posedge CLK,negedge rst_n)begin
     if(!rst_n)begin
         dout_reg <= 'd0;
     end
-    else if(bit_cnt=='d9&&bps_cnt==bps_mode-1) begin
+    else if(bit_cnt=='d11&&CLK_cnt==CLKS_PER_BIT-1) begin
         dout_reg <= 'd0;
     end
-    else if(bit_cnt >= 'd0 && bit_cnt <= 'd7 && bps_cnt == bps_mode-1)begin//当将有效数据全部存入后则停止
+    else if(bit_cnt >= 'd2 && bit_cnt <= 'd9 && CLK_cnt == CLKS_PER_BIT-1)begin//TAG 每当到达CLKS_PER_BITS时，处于有效数据的中间时刻
         dout_reg <= {RX_d2,dout_reg[7:1]};//移位寄存器
     end
 end
 
-//输出
-always@(posedge CLK_50M or negedge rst_n)
+//缓存输出
+always@(posedge CLK or negedge rst_n)
   if(~rst_n)
     dout <= 'd0;            
-  else if(bit_cnt == 'd9)//当前准备对停止位进行采样,但数据线上还是校验位，要等到bps_mode-1
+  else if(cs==RX_CHECK)//当前准备对校验位进行采样，此时输出已缓存的所有有效数据
     dout <= dout_reg;
 
 //校验结果
-always@(posedge CLK_50M or negedge rst_n)
-  if(~rst_n)
+always@(posedge CLK or negedge rst_n)
+  if(!rst_n)
     error <= 1'b0;  
   else if(!RX_flag)
     error <= 1'b0;  
-  else if(bit_cnt == 'd9)begin//根据当前数据线的校验位进行对比
+  else if(cs==RX_CHECK&&CLK_cnt==CLKS_PER_BIT-1)begin//根据当前数据线的校验位的中间时刻进行对比
     if(check != RX_d2)
       error <= 1'b1; 
     end
 
+//RX_dout_vld逻辑
+always @(posedge CLK,negedge rst_n) begin
+    if(!rst_n)
+        RX_dout_vld <= 0;
+    else if(cs==RX_CHECK&&CLK_cnt==0)
+        RX_dout_vld <= 1;
+    else
+        RX_dout_vld <= 0;
+end
+
 //奇偶校验
 assign e_check = ^dout_reg; //偶校验
 assign o_check = ~e_check; //奇校验
-
-assign check =(check_sel)? o_check : e_check;//奇偶校验选择
+assign check =(CHECK_SEL)? o_check : e_check;//奇偶校验选择
 endmodule
